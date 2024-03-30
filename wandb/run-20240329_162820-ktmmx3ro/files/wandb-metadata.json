@@ -1,0 +1,22 @@
+{
+    "os": "macOS-10.16-x86_64-i386-64bit",
+    "python": "3.9.18",
+    "heartbeatAt": "2024-03-29T16:28:22.737304",
+    "startedAt": "2024-03-29T16:28:20.646088",
+    "docker": null,
+    "cpu_count": 4,
+    "cuda": null,
+    "args": [],
+    "state": "running",
+    "program": "/Users/jiayi/Desktop/DLNLP_24_SN20069649/A/fine_tuned.py",
+    "codePath": "A/fine_tuned.py",
+    "git": {
+        "remote": "https://github.com/Jnlcy/DLNLP_24_SN20069649.git",
+        "commit": "88b046f3391247d2b72b9306d9b462a13d25f939"
+    },
+    "email": "jiayizhang01@gmail.com",
+    "root": "/Users/jiayi/Desktop/DLNLP_24_SN20069649",
+    "host": "eduroam-int-dhcp-97-194-85.ucl.ac.uk",
+    "username": "jiayi",
+    "executable": "/Applications/anaconda3/envs/lyric_trans/bin/python"
+}

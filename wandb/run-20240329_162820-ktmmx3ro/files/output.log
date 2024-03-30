@@ -1,0 +1,12 @@
+  0%|                                                                      | 0/400 [00:00<?, ?it/s]/Users/jiayi/Desktop/DLNLP_24_SN20069649/A/fine_tuned.py:17: UserWarning: To copy construct from a tensor, it is recommended to use sourceTensor.clone().detach() or sourceTensor.clone().detach().requires_grad_(True), rather than torch.tensor(sourceTensor).
+  item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
+
+
+
+
+
+
+
+
+  2%|▊                                  | 9/400 [2:07:26<147:50:20, 1361.18s/it]
+
