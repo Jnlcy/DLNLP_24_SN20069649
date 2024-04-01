@@ -115,7 +115,7 @@ def data_preprocessing(english_file_path, chinese_file_path):
 
     tokenizer.save_pretrained("model")
 
-    return train_dataset, test_dataset val_dataset
+    return train_dataset, test_dataset, val_dataset
 
     
 
