@@ -1,10 +1,14 @@
-from transformers import MBart50Tokenizer, MBartForConditionalGeneration, Trainer, TrainingArguments
+from transformers import MBartForConditionalGeneration, Trainer, TrainingArguments,DataCollatorForSeq2Seq
 from tqdm import tqdm
 import torch
-import torch.nn.functional as F
-from torch.utils.data import Dataset, TensorDataset, DataLoader
+from torch.utils.data import TensorDataset, DataLoader
 import numpy as np
 from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
+from transformers import DataCollatorForSeq2Seq
+import evaluate
+
+
+
 
 
 
@@ -45,21 +49,10 @@ def pair_sentences(english_file_path, chinese_file_path):
     return paired_sentences
 
 
-def tokenize_data(paired_sentences,tokenizer):
-     # Initialize lists to store tokenized input ids and attention masks, and labels (for the target texts)
-    input_ids = []
-    attention_masks = []
-    labels = []
-
+def tokenize_data(paired_sentences, tokenizer):
+    features = []
     
-
-    #src_lang_code = tokenizer.lang_code_to_id["en_XX"]  # English
-    #tgt_lang_code = tokenizer.lang_code_to_id["zh_CN"]  # Chinese
-
-    
-
     for pair in paired_sentences:
-        # MBart expects the language code at the beginning of the text
         src_text, tgt_text = pair
         src_text = tokenizer.bos_token + '<en_XX> ' + src_text
         tgt_text = tokenizer.bos_token + '<zh_CN> ' + tgt_text
@@ -70,25 +63,16 @@ def tokenize_data(paired_sentences,tokenizer):
         # Tokenize the target text
         tgt_encoding = tokenizer(tgt_text, truncation=True, padding='max_length', max_length=128, return_tensors="pt")
 
-        # Add the encoded texts to the lists
-        input_ids.append(src_encoding['input_ids'].squeeze(0))  # Remove batch dimension
-        attention_masks.append(src_encoding['attention_mask'].squeeze(0))  # Remove batch dimension
-        labels.append(tgt_encoding['input_ids'].squeeze(0))  # Remove batch dimension
+        feature = {
+            "input_ids": src_encoding['input_ids'].squeeze(0),  # Remove batch dimension
+            "attention_mask": src_encoding['attention_mask'].squeeze(0),  # Remove batch dimension
+            "labels": tgt_encoding['input_ids'].squeeze(0)  # Remove batch dimension
+        }
+        features.append(feature)
     
-    # Convert the lists to tensors
-    input_ids = torch.stack(input_ids)
-    attention_masks = torch.stack(attention_masks)
-    labels = torch.stack(labels)
+    return features
 
-
-    # Create a PyTorch dataset
-    dataset = TensorDataset(input_ids, attention_masks, labels)
-  
-
-    return tokenizer,dataset
-
-
-def data_preprocessing(english_file_path, chinese_file_path,device,tokenizer):
+def data_preprocessing(english_file_path, chinese_file_path,tokenizer):
 
     
 
@@ -96,7 +80,7 @@ def data_preprocessing(english_file_path, chinese_file_path,device,tokenizer):
     paired_sentences = pair_sentences(english_file_path, chinese_file_path)
 
     # Tokenize the data
-    tokenizer, dataset = tokenize_data(paired_sentences,tokenizer)
+    dataset = tokenize_data(paired_sentences,tokenizer)
 
     # Split the dataset
     train_size = int(0.8 * len(dataset))
@@ -105,12 +89,38 @@ def data_preprocessing(english_file_path, chinese_file_path,device,tokenizer):
     train_dataset, test_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, test_size, val_size])
 
 
-
     tokenizer.save_pretrained("model")
 
     return train_dataset, test_dataset, val_dataset
 
     
+def postprocess_text(preds, labels):
+    preds = [pred.strip() for pred in preds]
+    labels = [[label.strip()] for label in labels]
+
+    return preds, labels
+
+def compute_metrics(eval_preds,tokenizer):
+    metric = evaluate.load("sacrebleu")
+
+    preds, labels = eval_preds
+    if isinstance(preds, tuple):
+        preds = preds[0]
+    decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
+
+    labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+    decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+    decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
+
+    result = metric.compute(predictions=decoded_preds, references=decoded_labels)
+    result = {"bleu": result["score"]}
+
+    prediction_lens = [np.count_nonzero(pred != tokenizer.pad_token_id) for pred in preds]
+    result["gen_len"] = np.mean(prediction_lens)
+    result = {k: round(v, 4) for k, v in result.items()}
+    return result
+
 
 def evaluate_model(model, dataset, tokenizer, device):
     model.eval()  # Set the model to evaluation mode
@@ -145,7 +155,7 @@ def evaluate_model(model, dataset, tokenizer, device):
 
 
 
-def train_model(train_dataset, val_dataset,device):
+def train_model(train_dataset, val_dataset,tokenizer,device):
 
     
     # Load the model
@@ -153,10 +163,14 @@ def train_model(train_dataset, val_dataset,device):
     model.to(device)
     print("Model loaded")
 
+    # Data collator
+    data_collator = DataCollatorForSeq2Seq(tokenizer, model=model)
+
     # Training arguments
     training_args = TrainingArguments(
         output_dir='./results',          # output directory
-        num_train_epochs=1,              # total number of training epochs
+        evaluation_strategy= "epoch",
+        num_train_epochs=2,              # total number of training epochs
         per_device_train_batch_size=2,  # batch size per device during training
         per_device_eval_batch_size=2,   # batch size for evaluation
         warmup_steps=500,                # number of warmup steps for learning rate scheduler
@@ -172,8 +186,17 @@ def train_model(train_dataset, val_dataset,device):
         model=model,                         #  Transformers model to be trained
         args=training_args,                  # training arguments, defined above
         train_dataset=train_dataset,         # training dataset
-        eval_dataset=val_dataset             # evaluation dataset
+        eval_dataset=val_dataset ,            # evaluation dataset
+        data_collator=data_collator,         # Data collator
+        compute_metrics=compute_metrics
     )
+
+    # Define early stopping
+    # Stop if validation BLEU score doesn't improve for 3 epochs
+    early_stopping = EarlyStoppingCallback(early_stopping_patience=3) 
+    # Train the model with early stopping
+    trainer.add_callback(early_stopping)
+
 
     # Train the model
     trainer.train()
@@ -188,9 +211,11 @@ def train_model(train_dataset, val_dataset,device):
     #compute the bleu score
     train_bleu = evaluate_model(model, train_dataset, tokenizer, device)
 
+    val_bleu = evaluate_model(model, val_dataset, tokenizer, device)
+
    
 
-    return model,train_bleu
+    return model,train_bleu,val_bleu
 
 
 

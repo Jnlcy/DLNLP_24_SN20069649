@@ -29,7 +29,7 @@ train_dataset, val_dataset, test_dataset = data_preprocessing(english_file_path,
 
 # Task A
 
-bleu_A_train,model = train_model(train_dataset, val_dataset,device) # Train model based on the training set (you should fine-tune your model based on validation set.)
+model,bleu_A_train,bleu_A_val = train_model(train_dataset, val_dataset,tokenizer,device) # Train model based on the training set (you should fine-tune your model based on validation set.)
 bleu_A_test = evaluate_model(model, test_dataset,tokenizer,device)   # Test model based on the test set.
 
 model = None
