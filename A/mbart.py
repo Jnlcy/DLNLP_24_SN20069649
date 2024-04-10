@@ -1,16 +1,8 @@
-from transformers import MBartForConditionalGeneration, Trainer, TrainingArguments,DataCollatorForSeq2Seq
-from tqdm import tqdm
+from transformers import MBartForConditionalGeneration, Trainer, DataCollatorForSeq2Seq,EarlyStoppingCallback,Seq2SeqTrainingArguments
 import torch
-from torch.utils.data import TensorDataset, DataLoader
 import numpy as np
-from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
-from transformers import DataCollatorForSeq2Seq
 import evaluate
-
-
-
-
-
+from sacrebleu.metrics import BLEU
 
 
 
@@ -43,7 +35,11 @@ def pair_sentences(english_file_path, chinese_file_path):
     #print the first 5 pairs
     print(paired_sentences[:5])
 
-    #use the first 3000 pairs for now
+    #shuffle the pairs
+    np.random.seed(42)
+    np.random.shuffle(paired_sentences)
+
+    #use the first 10000 pairs for now
     paired_sentences = paired_sentences[:100000]
 
     return paired_sentences
@@ -72,7 +68,7 @@ def tokenize_data(paired_sentences, tokenizer):
     
     return features
 
-def data_preprocessing(english_file_path, chinese_file_path,tokenizer):
+def data_preprocessing_mbart(english_file_path, chinese_file_path,tokenizer):
 
     
 
@@ -93,92 +89,70 @@ def data_preprocessing(english_file_path, chinese_file_path,tokenizer):
 
     return train_dataset, test_dataset, val_dataset
 
+  
+
+
+
+
+def train_mbart(train_dataset, val_dataset,tokenizer,device):
+    # Define the post-processing function
+    def postprocess_text(preds, labels):
+        preds = [pred.strip() for pred in preds]
+        labels = [[label.strip()] for label in labels]
+
+        return preds, labels
     
-def postprocess_text(preds, labels):
-    preds = [pred.strip() for pred in preds]
-    labels = [[label.strip()] for label in labels]
 
-    return preds, labels
+    # Define the compute_metrics function
+    def compute_metrics(eval_preds):
 
-def compute_metrics(eval_preds,tokenizer):
-    metric = evaluate.load("sacrebleu")
+        metric = evaluate.load_metric("sacrebleu")
+        preds, labels = eval_preds
+        if isinstance(preds, tuple):
+            preds = preds[0]
+        decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
 
-    preds, labels = eval_preds
-    if isinstance(preds, tuple):
-        preds = preds[0]
-    decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
+        # Replace -100 in the labels as we can't decode them.
+        labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+        decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
 
-    labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
-    decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+        # Some simple post-processing
+        decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
 
-    decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
+        result = metric.compute(predictions=decoded_preds, references=decoded_labels)
+        result = {"bleu": result["score"]}
 
-    result = metric.compute(predictions=decoded_preds, references=decoded_labels)
-    result = {"bleu": result["score"]}
-
-    prediction_lens = [np.count_nonzero(pred != tokenizer.pad_token_id) for pred in preds]
-    result["gen_len"] = np.mean(prediction_lens)
-    result = {k: round(v, 4) for k, v in result.items()}
-    return result
+        prediction_lens = [np.count_nonzero(pred != tokenizer.pad_token_id) for pred in preds]
+        result["gen_len"] = np.mean(prediction_lens)
+        result = {k: round(v, 4) for k, v in result.items()}
+        return result
 
 
-def evaluate_model(model, dataset, tokenizer, device):
-    model.eval()  # Set the model to evaluation mode
-
-    # Create a DataLoader for the dataset
-    loader = DataLoader(dataset, batch_size=16)  # Adjust batch_size according to your needs and hardware capabilities
-    
-    predictions = []
-    references = []
-    
-    for input_ids, attention_mask, labels in tqdm(loader):
-        input_ids = input_ids.to(device)
-        attention_mask = attention_mask.to(device)
-        
-        with torch.no_grad():
-            outputs = model.generate(input_ids=input_ids, attention_mask=attention_mask)
-        
-        # Decode the generated ids to strings
-        batch_predictions = [tokenizer.decode(generated_id, skip_special_tokens=True) for generated_id in outputs]
-        predictions.extend(batch_predictions)
-        
-        # Decode the labels to strings
-        batch_references = [tokenizer.decode(label_id, skip_special_tokens=True) for label_id in labels]
-        references.extend([[ref] for ref in batch_references])  # Note: Each reference wrapped in a list for corpus_bleu
-    
-    # Compute BLEU score
-    smooth_fn = SmoothingFunction().method1 
-    bleu_score = corpus_bleu(references, [pred.split() for pred in predictions], smoothing_function=smooth_fn)
-    print(f"BLEU score: {bleu_score * 100:.2f}")
-    
-    return bleu_score
-
-
-
-def train_model(train_dataset, val_dataset,tokenizer,device):
-
-    
     # Load the model
     model = MBartForConditionalGeneration.from_pretrained('facebook/mbart-large-50')
     model.to(device)
     print("Model loaded")
-
     # Data collator
     data_collator = DataCollatorForSeq2Seq(tokenizer, model=model)
 
     # Training arguments
-    training_args = TrainingArguments(
+    training_args =Seq2SeqTrainingArguments(
         output_dir='./results',          # output directory
-        evaluation_strategy= "epoch",
-        num_train_epochs=2,              # total number of training epochs
-        per_device_train_batch_size=2,  # batch size per device during training
-        per_device_eval_batch_size=2,   # batch size for evaluation
+        evaluation_strategy = 'steps',
+        num_train_epochs=3,              # total number of training epochs
+        per_device_train_batch_size=4,  # batch size per device during training
+        per_device_eval_batch_size=4,   # batch size for evaluation
         warmup_steps=500,                # number of warmup steps for learning rate scheduler
         weight_decay=0.01,               # strength of weight decay
         logging_dir='./logs',            # directory for storing logs
         logging_steps=10,
+        eval_steps = 10,
+        save_total_limit=3,
         no_cuda=False,                  # use GPU
         fp16=True,                      # Use mixed precision
+        load_best_model_at_end = True,
+        metric_for_best_model='eval_loss',
+        predict_with_generate=True
     )
 
     # Trainer
@@ -187,35 +161,68 @@ def train_model(train_dataset, val_dataset,tokenizer,device):
         args=training_args,                  # training arguments, defined above
         train_dataset=train_dataset,         # training dataset
         eval_dataset=val_dataset ,            # evaluation dataset
-        data_collator=data_collator,         # Data collator
+        data_collator=data_collator ,       # Data collator
         compute_metrics=compute_metrics
     )
 
-    # Define early stopping
-    # Stop if validation BLEU score doesn't improve for 3 epochs
-    early_stopping = EarlyStoppingCallback(early_stopping_patience=3) 
-    # Train the model with early stopping
+    early_stopping = EarlyStoppingCallback(early_stopping_patience = 3)
     trainer.add_callback(early_stopping)
-
 
     # Train the model
     trainer.train()
 
     # Save the model
-    model.save_pretrained("model")
+    model.save_pretrained("model/mbart")
 
     # Evaluate the model
-    eval_results = trainer.evaluate()
-    print(f"Perplexity: {np.exp(eval_results['eval_loss']):.2f}")
-
-    #compute the bleu score
-    train_bleu = evaluate_model(model, train_dataset, tokenizer, device)
-
-    val_bleu = evaluate_model(model, val_dataset, tokenizer, device)
-
+    eval_results = test_model(model, tokenizer, val_dataset, device)
    
 
-    return model,train_bleu,val_bleu
+    return eval_results,model
+
+def test_model(model, tokenizer, test_dataset, device='cuda'):
+    model.eval()  # Set the model to evaluation mode
+    predictions = []
+    references = []
+    
+    with torch.no_grad():  # No need to track gradients
+        for item in test_dataset:
+            # Move tensors to the correct device
+            input_ids = item['input_ids'].unsqueeze(0).to(device)
+            attention_mask = item['attention_mask'].unsqueeze(0).to(device)
+            labels = item['labels'].unsqueeze(0).to(device)
+            
+            # Generate translation using the model
+            output = model.generate(input_ids, attention_mask=attention_mask)
+            
+            # Decode the generated ids to text
+            pred_text = tokenizer.decode(output[0], skip_special_tokens=True)
+            true_text = tokenizer.decode(labels[0], skip_special_tokens=True)
+            
+            predictions.append(pred_text)
+            references.append([true_text])  # BLEU expects a list of possible references
+    
+    # Compute BLEU score
+    bleu = BLEU()
+    scores = bleu.corpus_score(predictions, references)
+    
+    return scores
+
+
+    
+
+    
+
+
+  
+    
+
+
+
+
+
+
+
 
 
 
