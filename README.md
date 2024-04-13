@@ -10,18 +10,17 @@ This repository contains code for training and evaluating two powerful machine t
 * NVIDIA GPU with CUDA (Recommended for faster training)
 
 ### Installation
-'''
+```
 git clone https://github.com/Jnlcy/DLNLP_24_SN20069649
 cd DLNLP_24_SN20069649
 pip install -r requirements.txt
-
-'''
+```
 
 ### Usage
 
-'''
+```
 python main.py [model_type]
-'''
+```
 
 Where model_type is either 'mbart' or 't5'
 
