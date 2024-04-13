@@ -1,4 +1,4 @@
-from transformers import MT5ForConditionalGeneration, AutoTokenizer,Seq2SeqTrainingArguments,EarlyStoppingCallback
+from transformers import MT5ForConditionalGeneration, AutoTokenizer,Seq2SeqTrainingArguments
 from transformers import DataCollatorForSeq2Seq,Seq2SeqTrainer
 
 import torch
