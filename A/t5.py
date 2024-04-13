@@ -2,51 +2,51 @@ from transformers import MT5ForConditionalGeneration, AutoTokenizer,Seq2SeqTrain
 from transformers import DataCollatorForSeq2Seq,Seq2SeqTrainer
 
 import torch
-import evaluate
+import sacrebleu
 import numpy as np
-from mbart import read_file,pair_sentences
+from training_utils import clean_sentence,is_chinese_sentence
 
 
-def data_preprocessing_t5(english_file_path, chinese_file_path,device,tokenizer):
-    prefix = "translate English to Chinese: "
+def data_preprocessing_t5(dataset,tokenizer):
 
-    max_input_length = 128
-    max_target_length = 128
+    source_lang = "en"
+    target_lang = "zh_cn"
 
-    # Pair sentences
-    paired_sentences = pair_sentences(english_file_path, chinese_file_path)
+    prefix = "Translate English to Chinese: "
 
-    def tokenize_data(paired_sentences, tokenizer):
-        features = []
+    def preprocess_function(examples):
+        inputs = [prefix + example[source_lang] for example in examples["translation"]]
+        targets = [example[target_lang] for example in examples["translation"]]
+        model_inputs = tokenizer(inputs, text_target=targets, max_length=128, truncation=True)
 
-        for pair in paired_sentences:
-            src_text, tgt_text = pair
-            src_text = prefix + src_text
+        with tokenizer.as_target_tokenizer():
+            labels = tokenizer(targets, max_length=128, truncation=True, padding="max_length")
 
-            # Tokenize the source text
-            src_encoding = tokenizer(src_text, truncation=True, padding='max_length', max_length=128, return_tensors="pt")
-
-            # Tokenize the target text
-            tgt_encoding = tokenizer(tgt_text, truncation=True, padding='max_length', max_length=128, return_tensors="pt")
-
-            feature = {
-                "input_ids": src_encoding['input_ids'].squeeze(0),
-                "attention_mask": src_encoding['attention_mask'].squeeze(0),
-                "labels": tgt_encoding['input_ids'].squeeze(0)
-            }
-            features.append(feature)
-
-        return features
+        model_inputs["labels"] = labels["input_ids"]
+        return model_inputs
+        
     
-    # Tokenize the data
-    dataset = tokenize_data(paired_sentences,tokenizer)
+     #shuffle the dataset
+    dataset = dataset['train'].shuffle(seed=42)
 
-    # Split the dataset
+   #use the first 100000 pairs for now
+    dataset = dataset.select(range(500000))
+
+    #filter out non-Chinese sentences
+    dataset = dataset.filter(lambda example: is_chinese_sentence(example['translation']['zh_cn']))
+
+    print(dataset['translation'][:5])
+
+
+    tokenized_dataset = dataset.map(preprocess_function, batched=True,remove_columns=dataset.column_names)
+    #split the dataset
+
     train_size = int(0.8 * len(dataset))
     test_size = int(0.1 * len(dataset))
     val_size = len(dataset) - train_size - test_size
-    train_dataset, test_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, test_size, val_size])
-
+    train_dataset, test_dataset, val_dataset = torch.utils.data.random_split(tokenized_dataset, [train_size, test_size, val_size])
+    #print the lengths of the datasets
+    print(len(train_dataset), len(test_dataset), len(val_dataset))
 
 
     tokenizer.save_pretrained("model")
@@ -56,45 +56,46 @@ def data_preprocessing_t5(english_file_path, chinese_file_path,device,tokenizer)
 
 
 
-def train_t5(train_dataset, val_dataset,tokenizer,device):
+def train_t5(train_dataset, val_dataset,tokenizer):
 
-    model_checkpoint = "google/mt5-small"
+    model_checkpoint = "google/mt5-base"
     # import model and tokenizer
     model = MT5ForConditionalGeneration.from_pretrained(model_checkpoint)
     tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
 
-   
+    
 
-    def postprocess_text(preds, labels):
-        preds = [pred.strip() for pred in preds]
-        labels = [[label.strip()] for label in labels]
-
-        return preds, labels
-
+    
+    # Define the compute_metrics function
     def compute_metrics(eval_preds):
-        metric = evaluate.load_metric("sacrebleu")
-        preds, labels = eval_preds
-        if isinstance(preds, tuple):
-            preds = preds[0]
-        decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
 
-        # Replace -100 in the labels as we can't decode them.
+
+        preds, labels = eval_preds
+        preds = preds[0] if isinstance(preds, tuple) else preds
+
+        decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
         labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
         decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
 
-        # Some simple post-processing
-        decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
+        # Ensure character splitting for Chinese evaluation in both predictions and references
+        decoded_preds = [" ".join(list(pred)) for pred in decoded_preds]
+        bleu_references = [[" ".join(list(label))] for label in decoded_labels]  # Correct format for sacrebleu references
 
-        result = metric.compute(predictions=decoded_preds, references=decoded_labels)
-        result = {"bleu": result["score"]}
+
+        # Calculate BLEU scores
+        bleu_scores = sacrebleu.corpus_bleu(decoded_preds, bleu_references, force=True, use_effective_order=True)
 
         prediction_lens = [np.count_nonzero(pred != tokenizer.pad_token_id) for pred in preds]
-        result["gen_len"] = np.mean(prediction_lens)
-        result = {k: round(v, 4) for k, v in result.items()}
-        return result
+        avg_gen_len = np.mean(prediction_lens)
 
-    
+        # Combine and format results
+        result = {
 
+            "bleu": bleu_scores.score,
+            "gen_len": avg_gen_len,
+        }
+
+        return {k: round(v, 4) for k, v in result.items()}
     # data collator
     data_collator = DataCollatorForSeq2Seq(tokenizer, model=model)
 
@@ -134,13 +135,12 @@ def train_t5(train_dataset, val_dataset,tokenizer,device):
         tokenizer=tokenizer,
         compute_metrics=compute_metrics
     )
-    early_stopping = EarlyStoppingCallback(early_stopping_patience = 3)
-    trainer.add_callback(early_stopping)
-
     
+
+
     trainer.train()
     eval_results = trainer.evaluate()
     # Save the model
     model.save_pretrained("model/t5")
 
-    return eval_results,model
+    return eval_results["bleu"],model

@@ -1,89 +1,53 @@
-from transformers import MBartForConditionalGeneration, Trainer, DataCollatorForSeq2Seq,EarlyStoppingCallback,Seq2SeqTrainingArguments
+from transformers import MBartForConditionalGeneration, Seq2SeqTrainer, DataCollatorForSeq2Seq,MBart50Tokenizer,Seq2SeqTrainingArguments
 import torch
 import numpy as np
-import evaluate
-from sacrebleu.metrics import BLEU
+import sacrebleu
+import tqdm
+from training_utils import clean_sentence,is_chinese_sentence
 
 
 
+def data_preprocessing_mbart(dataset, tokenizer):
 
-def read_file(source_path, target_path):
-    with open(source_path, 'r') as file:
-        source_lines = file.readlines()
-    source_lines = [line.strip() for line in source_lines if line.strip()]
-    #filter out duplicates
-    #source_lines = list(set(source_lines))
+   
+    source_lang = "en"
+    target_lang = "zh_cn"
 
+    def preprocess_function(examples):
+        inputs = [example[source_lang] for example in examples["translation"]]
+        targets = [example[target_lang] for example in examples["translation"]]
+        model_inputs = tokenizer(inputs, text_target=targets, max_length=128, truncation=True)
 
-    with open(target_path, 'r') as file:
-        target_lines = file.readlines()
-    target_lines = [line.strip() for line in target_lines if line.strip()]
-    #filter out duplicates
-    #target_lines = list(set(target_lines))
+        with tokenizer.as_target_tokenizer():
+            labels = tokenizer(targets, max_length=128, truncation=True, padding="max_length")
 
-    return source_lines, target_lines
-
-def pair_sentences(english_file_path, chinese_file_path):
-    # Check if both files have the same number of lines
-    english_lines, chinese_lines = read_file(english_file_path, chinese_file_path)
-    assert len(english_lines) == len(chinese_lines), "Files are not aligned"
-
-    # Pair the sentences together
-    paired_sentences = list(zip(english_lines, chinese_lines))
-    # Now `paired_sentences` is a list of tuples, where each tuple is a pair of corresponding English and Chinese sentences
-
-    #print the first 5 pairs
-    print(paired_sentences[:5])
-
-    #shuffle the pairs
-    np.random.seed(42)
-    np.random.shuffle(paired_sentences)
-
-    #use the first 10000 pairs for now
-    paired_sentences = paired_sentences[:100000]
-
-    return paired_sentences
-
-
-def tokenize_data(paired_sentences, tokenizer):
-    features = []
+        model_inputs["labels"] = labels["input_ids"]
+        return model_inputs
     
-    for pair in paired_sentences:
-        src_text, tgt_text = pair
-        src_text = tokenizer.bos_token + '<en_XX> ' + src_text
-        tgt_text = tokenizer.bos_token + '<zh_CN> ' + tgt_text
+    #shuffle the dataset
+    dataset = dataset['train'].shuffle(seed=42)
 
-        # Tokenize the source text
-        src_encoding = tokenizer(src_text, truncation=True, padding='max_length', max_length=128, return_tensors="pt")
+   #use the first 100000 pairs for now
+    dataset = dataset.select(range(500000))
 
-        # Tokenize the target text
-        tgt_encoding = tokenizer(tgt_text, truncation=True, padding='max_length', max_length=128, return_tensors="pt")
+    #filter out non-Chinese sentences
+    dataset = dataset.filter(lambda example: is_chinese_sentence(example['translation']['zh_cn']))
 
-        feature = {
-            "input_ids": src_encoding['input_ids'].squeeze(0),  # Remove batch dimension
-            "attention_mask": src_encoding['attention_mask'].squeeze(0),  # Remove batch dimension
-            "labels": tgt_encoding['input_ids'].squeeze(0)  # Remove batch dimension
-        }
-        features.append(feature)
-    
-    return features
+    print(dataset['translation'][:5])
 
-def data_preprocessing_mbart(english_file_path, chinese_file_path,tokenizer):
+
+    tokenized_dataset = dataset.map(preprocess_function, batched=True,remove_columns=dataset.column_names)
 
     
 
-    # Pair sentences
-    paired_sentences = pair_sentences(english_file_path, chinese_file_path)
+    #split the dataset
 
-    # Tokenize the data
-    dataset = tokenize_data(paired_sentences,tokenizer)
-
-    # Split the dataset
     train_size = int(0.8 * len(dataset))
     test_size = int(0.1 * len(dataset))
     val_size = len(dataset) - train_size - test_size
-    train_dataset, test_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, test_size, val_size])
-
+    train_dataset, test_dataset, val_dataset = torch.utils.data.random_split(tokenized_dataset, [train_size, test_size, val_size])
+    #print the lengths of the datasets
+    print(len(train_dataset), len(test_dataset), len(val_dataset))
 
     tokenizer.save_pretrained("model")
 
@@ -95,78 +59,91 @@ def data_preprocessing_mbart(english_file_path, chinese_file_path,tokenizer):
 
 
 def train_mbart(train_dataset, val_dataset,tokenizer,device):
-    # Define the post-processing function
-    def postprocess_text(preds, labels):
-        preds = [pred.strip() for pred in preds]
-        labels = [[label.strip()] for label in labels]
+    #initialize tokenizer
+    model_checkpoint = "facebook/mbart-large-50"
+    tokenizer = MBart50Tokenizer.from_pretrained(model_checkpoint)
+    print("Tokenizer loaded")
 
-        return preds, labels
+    model = MBartForConditionalGeneration.from_pretrained(model_checkpoint)
+
+    print("number of parameters:", model.num_parameters())
+
+
+    
     
 
     # Define the compute_metrics function
     def compute_metrics(eval_preds):
 
-        metric = evaluate.load_metric("sacrebleu")
-        preds, labels = eval_preds
-        if isinstance(preds, tuple):
-            preds = preds[0]
-        decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
 
-        # Replace -100 in the labels as we can't decode them.
+        preds, labels = eval_preds
+        preds = preds[0] if isinstance(preds, tuple) else preds
+
+        decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
         labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
         decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
 
-        # Some simple post-processing
-        decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
+        # Ensure character splitting for Chinese evaluation in both predictions and references
+        decoded_preds = [" ".join(list(pred)) for pred in decoded_preds]
+        bleu_references = [[" ".join(list(label))] for label in decoded_labels]  # Correct format for sacrebleu references
 
-        result = metric.compute(predictions=decoded_preds, references=decoded_labels)
-        result = {"bleu": result["score"]}
+
+        # Calculate BLEU scores
+        bleu_scores = sacrebleu.corpus_bleu(decoded_preds, bleu_references, force=True, use_effective_order=True)
 
         prediction_lens = [np.count_nonzero(pred != tokenizer.pad_token_id) for pred in preds]
-        result["gen_len"] = np.mean(prediction_lens)
-        result = {k: round(v, 4) for k, v in result.items()}
-        return result
+        avg_gen_len = np.mean(prediction_lens)
 
+        # Combine and format results
+        result = {
 
-    # Load the model
-    model = MBartForConditionalGeneration.from_pretrained('facebook/mbart-large-50')
-    model.to(device)
-    print("Model loaded")
-    # Data collator
+            "bleu": bleu_scores.score,
+            "gen_len": avg_gen_len,
+        }
+
+        return {k: round(v, 4) for k, v in result.items()}
+
     data_collator = DataCollatorForSeq2Seq(tokenizer, model=model)
 
-    # Training arguments
-    training_args =Seq2SeqTrainingArguments(
-        output_dir='./results',          # output directory
-        evaluation_strategy = 'steps',
-        num_train_epochs=3,              # total number of training epochs
-        per_device_train_batch_size=4,  # batch size per device during training
-        per_device_eval_batch_size=4,   # batch size for evaluation
-        warmup_steps=500,                # number of warmup steps for learning rate scheduler
-        weight_decay=0.01,               # strength of weight decay
-        logging_dir='./logs',            # directory for storing logs
-        logging_steps=10,
-        eval_steps = 10,
-        save_total_limit=3,
-        no_cuda=False,                  # use GPU
-        fp16=True,                      # Use mixed precision
-        load_best_model_at_end = True,
-        metric_for_best_model='eval_loss',
-        predict_with_generate=True
-    )
+    
 
-    # Trainer
-    trainer = Trainer(
-        model=model,                         #  Transformers model to be trained
-        args=training_args,                  # training arguments, defined above
-        train_dataset=train_dataset,         # training dataset
-        eval_dataset=val_dataset ,            # evaluation dataset
-        data_collator=data_collator ,       # Data collator
+
+    source_lang = "en"
+    target_lang = "zh_cn"
+
+    batch_size = 4
+    model_name = model_checkpoint.split("/")[-1]
+    args = Seq2SeqTrainingArguments(
+        f"{model_name}-finetuned-{source_lang}-to-{target_lang}",
+        evaluation_strategy = "epoch",
+        save_strategy ="epoch",
+        warmup_steps = 500,
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size,
+        weight_decay=0.01,
+        save_total_limit=2,
+        learning_rate=5e-5,
+        lr_scheduler_type='linear',
+        num_train_epochs=2,
+        report_to = "wandb",
+        predict_with_generate=True,
+        load_best_model_at_end = True,
+        metric_for_best_model="rougeL",
+        fp16=False,
+        logging_dir='.logs',
+        logging_steps=100)
+
+
+    trainer = Seq2SeqTrainer(
+        model,
+        args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        data_collator=data_collator,
+        tokenizer=tokenizer,
         compute_metrics=compute_metrics
     )
 
-    early_stopping = EarlyStoppingCallback(early_stopping_patience = 3)
-    trainer.add_callback(early_stopping)
 
     # Train the model
     trainer.train()
@@ -175,37 +152,49 @@ def train_mbart(train_dataset, val_dataset,tokenizer,device):
     model.save_pretrained("model/mbart")
 
     # Evaluate the model
-    eval_results = test_model(model, tokenizer, val_dataset, device)
+    eval_results = trainer.evaluate()
    
 
-    return eval_results,model
+    return eval_results["bleu"],model
 
-def test_model(model, tokenizer, test_dataset, device='cuda'):
+def test_model(model, tokenizer, test_dataset, device='cuda', max_new_tokens=50,print_example = False):
     model.eval()  # Set the model to evaluation mode
     predictions = []
     references = []
-    
+
     with torch.no_grad():  # No need to track gradients
-        for item in test_dataset:
-            # Move tensors to the correct device
-            input_ids = item['input_ids'].unsqueeze(0).to(device)
-            attention_mask = item['attention_mask'].unsqueeze(0).to(device)
-            labels = item['labels'].unsqueeze(0).to(device)
-            
+        for item in tqdm(test_dataset, desc='Evaluating'):
+            # Convert lists to tensors and move them to the specified device
+            input_ids = torch.tensor(item['input_ids']).unsqueeze(0).to(device)
+            attention_mask = torch.tensor(item['attention_mask']).unsqueeze(0).to(device)
+            labels = torch.tensor(item['labels']).unsqueeze(0).to(device)
+
             # Generate translation using the model
-            output = model.generate(input_ids, attention_mask=attention_mask)
-            
+            output = model.generate(input_ids, attention_mask=attention_mask, max_new_tokens=max_new_tokens)
+
             # Decode the generated ids to text
             pred_text = tokenizer.decode(output[0], skip_special_tokens=True)
+            pred_processed = " ".join(list(pred_text))
             true_text = tokenizer.decode(labels[0], skip_special_tokens=True)
-            
-            predictions.append(pred_text)
-            references.append([true_text])  # BLEU expects a list of possible references
-    
+
+            true_processed = " ".join(list(true_text))
+
+            #print(pred_text)
+            #print(true_text)
+            predictions.append(pred_processed)
+            references.append([true_processed])
+
+
+    if print_example:
+        for i in range(5):
+            print(f"Prediction: {predictions[i]}")
+            print(f"Reference: {references[i]}")
+            print()
     # Compute BLEU score
-    bleu = BLEU()
-    scores = bleu.corpus_score(predictions, references)
-    
+   
+
+    scores = sacrebleu.corpus_bleu(predictions, references,use_effective_order=True)
+
     return scores
 
 
